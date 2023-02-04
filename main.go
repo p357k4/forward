@@ -179,8 +179,9 @@ func (p *mitmProxy) proxyConnect(w http.ResponseWriter, proxyReq *http.Request) 
 
 	// modify request
 	request.Header.Set("Authorization", "bearer token")
+	request.Header.Set("Connection", "close")
 
-	dial, err := net.Dial("tcp", proxyReq.RequestURI)
+	dial, err := net.DialTimeout("tcp", proxyReq.RequestURI, 10*time.Second)
 	if err != nil {
 		slog.Errorf("dialing failed %+v", err)
 		return
@@ -199,22 +200,8 @@ func (p *mitmProxy) proxyConnect(w http.ResponseWriter, proxyReq *http.Request) 
 
 	wg := &sync.WaitGroup{}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(server, client)
-		slog.ErrorT(err)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(client, server)
-		slog.ErrorT(err)
-	}()
-
-	//tunnel(wg, server, client)
-	//tunnel(wg, client, server)
+	tunnel(wg, server, client)
+	tunnel(wg, client, server)
 
 	wg.Wait()
 }
