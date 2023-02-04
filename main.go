@@ -136,18 +136,18 @@ func (p *mitmProxy) proxyConnect(w http.ResponseWriter, proxyReq *http.Request) 
 
 	// "Hijack" the client connection to get a TCP (or TLS) socket we can read
 	// and write arbitrary data to/from.
-	hj, ok := w.(http.Hijacker)
+	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		slog.Error("http server doesn't support hijacking connection")
 		return
 	}
 
-	clientConn, _, err := hj.Hijack()
+	hijacked, _, err := hijacker.Hijack()
 	if err != nil {
 		slog.Error("http hijacking failed")
 		return
 	}
-	defer closeConnection(clientConn)
+	defer closeConnection(hijacked)
 
 	host, _, err := net.SplitHostPort(proxyReq.Host)
 	if err != nil {
@@ -159,7 +159,7 @@ func (p *mitmProxy) proxyConnect(w http.ResponseWriter, proxyReq *http.Request) 
 	// our certificate. This server will now pretend being the target.
 	tlsConfig, ok := p.configCache[host]
 	if !ok {
-		tlsConfig, err := p.certSetup(host)
+		tlsConfig, err = p.certSetup(host)
 		if err != nil {
 			slog.Error("error creating server configuration: %+v", err)
 			return
@@ -168,20 +168,7 @@ func (p *mitmProxy) proxyConnect(w http.ResponseWriter, proxyReq *http.Request) 
 		p.configCache[host] = tlsConfig
 	}
 
-	server := tls.Server(clientConn, tlsConfig)
-	//defer closeConnection(server)
-
-	dial, err := net.Dial("tcp", proxyReq.RequestURI)
-	if err != nil {
-		slog.Errorf("dialing failed %+v", err)
-		return
-	}
-	client := tls.Client(dial, &tls.Config{
-		InsecureSkipVerify: true,
-	})
-	defer closeConnection(client)
-
-	wg := &sync.WaitGroup{}
+	server := tls.Server(hijacked, tlsConfig)
 
 	// Run the proxy in a loop until the client closes the connection.
 	request, err := http.ReadRequest(bufio.NewReader(server))
@@ -190,30 +177,60 @@ func (p *mitmProxy) proxyConnect(w http.ResponseWriter, proxyReq *http.Request) 
 		return
 	}
 
+	// modify request
 	request.Header.Set("Authorization", "bearer token")
+
+	dial, err := net.Dial("tcp", proxyReq.RequestURI)
+	if err != nil {
+		slog.Errorf("dialing failed %+v", err)
+		return
+	}
+	defer closeConnection(dial)
+
+	client := tls.Client(dial, &tls.Config{
+		InsecureSkipVerify: true,
+	})
+
 	err = request.Write(client)
 	if err != nil {
 		slog.Errorf("forwarding request failed %+v", err)
 		return
 	}
 
-	tunnel(wg, server, client)
-	tunnel(wg, client, server)
+	wg := &sync.WaitGroup{}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(server, client)
+		slog.ErrorT(err)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(client, server)
+		slog.ErrorT(err)
+	}()
+
+	//tunnel(wg, server, client)
+	//tunnel(wg, client, server)
 
 	wg.Wait()
 }
 
 func closeConnection(server io.Closer) {
+	slog.Println("closing connection")
 	err := server.Close()
 	slog.ErrorT(err)
 }
 
-func tunnel(wg *sync.WaitGroup, dst net.Conn, src net.Conn) {
+func tunnel(wg *sync.WaitGroup, dst io.Writer, src io.Reader) {
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		_, err := io.Copy(dst, src)
 		slog.ErrorT(err)
+		wg.Done()
 	}()
 }
 
